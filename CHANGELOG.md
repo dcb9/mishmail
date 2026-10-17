@@ -255,7 +255,7 @@ minor versions may still change behavior.
   mailbox.** New compose pins the Gmail API to the selected identity, not
   the autosave draft's account. The old pin made a From change (e.g. to
   berkeley after inserting `/bball`) send via the default mailbox, and
-  Gmail rewrote From to that mailbox's default send-as (`ron@ronboger.com`).
+  Gmail rewrote From to that mailbox's default send-as address.
   Replies still stay on the thread's mailbox. Changing From also dirties
   the draft so the next save migrates it.
 - **Multi-select `h`/`b` snooze only snoozed the last-focused thread, not

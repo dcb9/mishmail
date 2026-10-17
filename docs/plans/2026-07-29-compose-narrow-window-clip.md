@@ -13,7 +13,7 @@ clips content so the draft is unusable. Screenshot (2026-07-29):
 - Inline (or docked) reply open under the Aidan Pratt thread.
 - Card header / body / From / To / Subject all lose their left edge mid-glyph:
   - context line shows `ying to Aidan Pratt` (should be `Replying to …`)
-  - From shows `on@ronboger.com` (label + start of address gone)
+  - From shows `on@example.com` (label + start of address gone)
   - Subject shows `fellow, opening a round` (lost `Re: KP `)
   - body starts mid-phrase
 - Thread list dates sit immediately left of the cut.

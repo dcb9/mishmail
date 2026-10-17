@@ -23,7 +23,7 @@ checks: make test → TEST SUCCEEDED, 1637 tests, 5 skipped, 0 failures
 ```
 Review the complete diff against the requested task. Check correctness, regressions, and test coverage. Give findings by severity and finish with SHIP or NOT READY.
 
-Task: (1) Make the compose From picker clearer — every identity showed the same display name (Ron Boger) so the domain was hard to scan. (2) Investigate/fix a bug where changing From to berkeley (especially around /bball snippet send) still sent from ron@ronboger.com.
+Task: (1) Make the compose From picker clearer — every identity showed the same display name (Ron Boger) so the domain was hard to scan. (2) Investigate/fix a bug where changing From to berkeley (especially around /bball snippet send) still sent from the mailbox's default send-as address.
 
 The implementer diagnosed: new compose pinned apiAccountId to the first autosave draft's mailbox, so a later From change still sent through the original mailbox and Gmail rewrote From to that mailbox's default send-as.
 ```
