@@ -1,28 +1,86 @@
 import Foundation
 
-/// Token bucket for Gmail's per-user quota: 250 units per second, enforced
-/// as a moving average.
+/// Gmail's per-user quota tier.
 ///
-/// A history catch-up that fires four 50-message batches back to back spends
-/// 1000 units in about two seconds. Gmail answers the one that crosses the
-/// line with 403 `userRateLimitExceeded` and drops the HTTP/3 connection,
-/// which fails every other in-flight get too. The engine then refuses to
-/// advance the history id, and the next pass replays the same range and hits
-/// the same wall — forever. Pacing the spend below the average, in smaller
-/// batches, keeps a pass under the ceiling.
+/// On 1 May 2026 Google cut the per-user limit for **new** Cloud projects to
+/// 6,000 units a minute (from 15,000) and raised the price of the methods
+/// MishMail leans on: `messages.get` is 20 units, or 60 when `format` is
+/// `full`/`raw`/`html` — which is what a first sync uses. Projects that
+/// already used the API between November 2025 and April 2026 keep 15,000.
+///
+/// The client cannot read a project's quota, and every MishMail user creates
+/// their own OAuth client, so this is a setting. `standard` is the safe
+/// default: a new user is on a new project and overspending earns 403s.
+/// <https://developers.google.com/workspace/gmail/api/reference/quota>
+///
+/// Refill runs at 90% of the ceiling and burst capacity is six seconds of
+/// refill, so even a minute that starts with a full bucket stays under the
+/// limit: `capacity + 60 * refill` is 5,940 (standard) and 14,850 (legacy).
+enum GmailQuotaTier: String, CaseIterable, Identifiable {
+    /// Projects created on or after 1 May 2026.
+    case standard
+    /// Projects grandfathered at the old 15,000 units a minute.
+    case legacy
+
+    static let defaultsKey = "gmail.quotaTier"
+
+    var id: String { rawValue }
+
+    /// What the current setting says. Read on every use so flipping it in
+    /// Settings takes effect without a relaunch.
+    static var current: GmailQuotaTier {
+        guard let raw = UserDefaults.standard.string(forKey: defaultsKey) else {
+            return .standard
+        }
+        return GmailQuotaTier(rawValue: raw) ?? .standard
+    }
+
+    var unitsPerMinute: Int {
+        switch self {
+        case .standard: return 6_000
+        case .legacy: return 15_000
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .standard: return "6,000 units a minute (new projects)"
+        case .legacy: return "15,000 units a minute (existing projects)"
+        }
+    }
+
+    /// 90% of the ceiling, in units per second.
+    var refillPerSecond: Int { unitsPerMinute * 9 / 10 / 60 }
+    /// Six seconds of refill: enough to send a batch of full messages without
+    /// stalling, small enough that a full bucket plus a minute of refill still
+    /// stays under the limit (540 + 60×90 = 5,940 of 6,000).
+    var capacity: Int { refillPerSecond * 6 }
+}
+
+/// Token bucket for Gmail's per-user quota.
+///
+/// A history catch-up that fires batches back to back spends faster than the
+/// per-minute allowance. Gmail answers the one that crosses the line with 403
+/// `rateLimitExceeded` and drops the HTTP/3 connection, which fails every
+/// other in-flight get too. The engine then refuses to advance the history
+/// id, and the next pass replays the same range and hits the same wall —
+/// forever. Pacing the spend below the allowance, in smaller batches, keeps a
+/// pass under the ceiling.
 ///
 /// Pure value type so the pacing math is unit-tested; `GmailClient` owns one
 /// per account (the limit is per user) and sleeps for the delay it returns.
 struct GmailQuotaBucket {
-    /// `messages.get` costs 5 units regardless of format.
-    static let messageGetUnits = 5
-    /// Keep a half-second of burst capacity. Gmail's 250 units/s limit is a
-    /// moving average, so a 125-unit burst leaves room for refill while the
-    /// next request is in flight.
-    static let defaultCapacity = 125
-    /// Below Gmail's 250/s so the moving average never touches the ceiling.
-    static let defaultRefillPerSecond = 200
-
+    /// `messages.get` costs 20 units for `metadata`/`minimal`.
+    static let messageGetUnits = 20
+    /// …and 60 for `full`, `raw` or `html`, which is what body fetches use.
+    static let messageGetFullUnits = 60
+    /// Two seconds of refill at the standard tier.
+    static let defaultCapacity = GmailQuotaTier.standard.capacity
+    /// 90% of the standard tier's 6,000 units a minute.
+    static let defaultRefillPerSecond = GmailQuotaTier.standard.refillPerSecond
+    /// Which tier this bucket was built for, so `GmailClient` can notice a
+    /// settings change and rebuild. Nil for a bucket with explicit numbers.
+    let tier: GmailQuotaTier?
     let capacity: Int
     let refillPerSecond: Int
     /// Units still spendable at `lastRefill`. May go negative: a spend that
@@ -31,15 +89,26 @@ struct GmailQuotaBucket {
     private var lastRefill: Date?
     private var blockedUntil: Date?
 
-    init(capacity: Int = defaultCapacity, refillPerSecond: Int = defaultRefillPerSecond) {
+    init(tier: GmailQuotaTier = .standard) {
+        self.tier = tier
+        self.capacity = tier.capacity
+        self.refillPerSecond = tier.refillPerSecond
+        self.tokens = Double(capacity)
+        self.blockedUntil = nil
+    }
+
+    init(capacity: Int, refillPerSecond: Int) {
+        self.tier = nil
         self.capacity = capacity
         self.refillPerSecond = refillPerSecond
         self.tokens = Double(capacity)
         self.blockedUntil = nil
     }
 
-    static func units(forMessageGets count: Int) -> Int {
-        count * messageGetUnits
+    /// Cost of `count` message gets. `fullFormat` must match the format the
+    /// caller will request: Gmail charges 60, not 20, for a full body.
+    static func units(forMessageGets count: Int, fullFormat: Bool = true) -> Int {
+        count * (fullFormat ? messageGetFullUnits : messageGetUnits)
     }
 
     /// Longest penalty the bucket keeps: the longest wait honored from a

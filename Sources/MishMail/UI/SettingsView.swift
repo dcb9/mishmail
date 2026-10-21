@@ -138,6 +138,11 @@ struct GoogleAPISettings: View {
     // Start in edit mode only when nothing is saved yet; otherwise show the
     // saved credentials read-only behind an explicit Edit button.
     @State private var editing = !OAuthConfig.isConfigured
+    @AppStorage(GmailQuotaTier.defaultsKey) private var quotaTierRaw = GmailQuotaTier.standard.rawValue
+
+    private var quotaTier: GmailQuotaTier {
+        GmailQuotaTier(rawValue: quotaTierRaw) ?? .standard
+    }
 
     private var trimmedID: String { clientID.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var trimmedSecret: String { clientSecret.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -213,6 +218,23 @@ struct GoogleAPISettings: View {
                         Text("These credentials are saved — the Client ID in app preferences, the secret in your Keychain. Click Edit to change them.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                }
+
+                Section {
+                    Picker("Gmail quota", selection: $quotaTierRaw) {
+                        ForEach(GmailQuotaTier.allCases) { tier in
+                            Text(tier.title).tag(tier.rawValue)
+                        }
+                    }
+                    LabeledContent("Sync rate") {
+                        Text("\(quotaTier.refillPerSecond) units a second")
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Gmail API quota")
+                } footer: {
+                    Text("Google lowered the per-user limit to 6,000 units a minute for Cloud projects created on or after 1 May 2026, and raised the cost of reading a message. Leave this on 6,000 unless your project predates that date: check APIs & Services → Gmail API → Quotas in the Google Cloud console. Projects that used the API between November 2025 and April 2026 kept 15,000. Choosing the higher rate on a new project brings back 403 quota errors during sync.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)

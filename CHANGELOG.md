@@ -29,12 +29,18 @@ minor versions may still change behavior.
   Snooze and Label in the palette apply to the whole selection.
 
 ### Fixed
+- **Sync no longer trips Gmail's 2026 quota.** Google cut the per-user limit
+  to 6,000 units a minute for Cloud projects created on or after 1 May 2026
+  and made reading a message cost 60 units instead of 5, so a first sync
+  spent several times the allowance and got bursts of 403 quota errors.
+  MishMail now paces each account at 90 units a second and prices every call
+  from Google's current table. Projects that predate the change can pick
+  their old 15,000 rate in Settings → Google API.
 - **Compose no longer hides the last lines of a reply** at a larger text
   size. The body is sized from the real text layout.
 
 ### Changed
-- **Faster everywhere.** A performance pass across launch, the thread list,
-  the reading pane and sync:
+- **Faster everywhere.** A performance pass across launch, the thread list,  the reading pane and sync:
   - The mail cache now uses its encryption key directly instead of running
     a 256,000-round key derivation on every database connection (about
     75 ms each). The first launch after updating converts the file once,

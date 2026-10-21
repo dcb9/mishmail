@@ -301,7 +301,7 @@ actor GmailClient {
                              query: [String: String] = [:],
                              jsonBody: [String: Any]? = nil,
                              retryRateLimit: Bool = true) async throws -> Data {
-        let cost = Self.quotaCost(method: method, path: path)
+        let cost = Self.quotaCost(method: method, path: path, format: query["format"])
         var didRefreshAfter401 = false
         var rateAttempt = 0
         while true {
@@ -486,27 +486,64 @@ actor GmailClient {
         return true
     }
 
+    /// `full`, `raw` and `html` are the three formats Gmail bills at the
+    /// higher per-message price.
+    nonisolated static func isFullFormat(_ format: String) -> Bool {
+        ["full", "raw", "html"].contains(format)
+    }
+
     /// Max messages per `batch/gmail/v1` request (Gmail allows up to 100).
-    /// A batch is charged all at once — 5 units per message — against a
-    /// 250 units/s moving average, so 25 keeps one batch within the burst cap.
-    nonisolated static let batchGetChunkSize = 25
+    ///
+    /// A batch is charged for every part at once: eight full-format messages
+    /// are 480 units, which fits the standard tier's 540-unit burst. The old
+    /// value of 25 was chosen against 5-unit messages; at 60 the same chunk
+    /// would be 1,500 units, a quarter of the minute in one burst.
+    ///
+    /// This is not a throughput limit: 6,000 units a minute buys about 100
+    /// full messages a minute whatever the chunk size.
+    nonisolated static let batchGetChunkSize = 8
 
     /// Max attempts for a single get on retryable errors (429/5xx/network).
     nonisolated static let getRetryAttempts = 3
     nonisolated static let requestRetryAttempts = 3
 
-    nonisolated static func quotaCost(method: String, path: String) -> Int {
+    /// Units Gmail charges for one call, from the published per-method table
+    /// (updated 1 May 2026). `format` matters for message and draft gets: a
+    /// `full`/`raw`/`html` body costs three times the metadata price.
+    /// <https://developers.google.com/workspace/gmail/api/reference/quota>
+    nonisolated static func quotaCost(method: String, path: String,
+                                     format: String? = nil) -> Int {
+        let isFullFormat = format.map(Self.isFullFormat) ?? false
+        let messageGet = isFullFormat
+            ? GmailQuotaBucket.messageGetFullUnits
+            : GmailQuotaBucket.messageGetUnits
         if path == "/profile" { return 1 }
-        if path == "/labels" { return 1 }
+        // labels.list is 1; labels.create/delete/update are 5.
+        if path == "/labels" { return method == "GET" ? 1 : 5 }
+        if path.hasPrefix("/labels/") { return method == "GET" ? 1 : 5 }
         if path == "/history" { return 2 }
         if path == "/messages" { return 5 }
         if path == "/messages/send" { return 100 }
-        if path.contains("/attachments/") { return 5 }
-        if path.hasPrefix("/messages/") && path.hasSuffix("/modify") { return 10 }
-        if path.hasPrefix("/messages/") { return 5 }
-        if path.hasPrefix("/threads/") { return 10 }
+        if path.contains("/attachments/") { return 20 }
+        if path.hasPrefix("/messages/") && path.hasSuffix("/modify") { return 5 }
+        if path.hasPrefix("/messages/") && path.hasSuffix("/trash") { return 20 }
+        if path.hasPrefix("/messages/") && path.hasSuffix("/untrash") { return 5 }
+        if path.hasPrefix("/messages/") { return messageGet }
+        if path.hasPrefix("/threads/") {
+            if path.hasSuffix("/modify") { return 10 }
+            if path.hasSuffix("/trash") { return 20 }
+            if path.hasSuffix("/untrash") { return 10 }
+            if method == "DELETE" { return 20 }
+            // threads.get is 40, or 120 for a full-format body.
+            return isFullFormat ? 120 : 40
+        }
         if path == "/drafts" || path.hasPrefix("/drafts/") {
-            return method == "GET" ? 1 : 10
+            if method == "DELETE" { return 10 }                        // drafts.delete
+            if method == "POST" && path == "/drafts" { return 10 }     // drafts.create
+            if method == "PUT" || method == "PATCH" { return 15 }      // drafts.update
+            // drafts.list is 5; drafts.get is 20 (60 for a full body).
+            if method == "GET" { return path == "/drafts" ? 5 : messageGet }
+            return 10
         }
         return 1
     }
@@ -668,7 +705,16 @@ actor GmailClient {
 
     /// Per-account token bucket (Gmail's limit is per user). Sleeping inside
     /// the actor is fine: `Task.sleep` suspends and other calls proceed.
-    private var quota = GmailQuotaBucket()
+    private var quota = GmailQuotaBucket(tier: .current)
+
+    /// Rebuilds the bucket when the quota tier changed in Settings. Kept out
+    /// of `pace`'s hot path: a rebuild discards accumulated tokens and any
+    /// penalty, so it only happens on an actual tier change.
+    private func refreshQuotaTier() {
+        let wanted = GmailQuotaTier.current
+        guard quota.tier != wanted else { return }
+        quota = GmailQuotaBucket(tier: wanted)
+    }
 
     /// Clock for the quota bucket. System uptime only moves forward, so a
     /// wall-clock change (NTP step, manual set, sleep/wake skew) cannot
@@ -685,6 +731,7 @@ actor GmailClient {
     /// ignored, and the bucket's refill spacing releases parked callers one
     /// by one instead of all together.
     private func pace(units: Int) async throws {
+        refreshQuotaTier()
         while true {
             let penalty = quota.penaltyRemaining(now: Self.quotaNow())
             if penalty > 0 {
@@ -703,11 +750,12 @@ actor GmailClient {
         try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
     }
 
-    /// A batch is charged 5 units per id, all at once, so pace before sending.
+    /// A batch is charged per id, all at once, so pace before sending.
     /// A rate-limited batch is retried after a whole-second backoff rather
     /// than exploded into singles on a connection Gmail has just dropped —
     /// those singles only fail again and pin the history id for the pass.
     private func batchWithRateLimitRetry(ids: [String], format: String) async throws -> MessageFetchReport {
+        refreshQuotaTier()
         var pending = ids
         var report = MessageFetchReport()
         for attempt in 0..<Self.getRetryAttempts {
@@ -812,7 +860,8 @@ actor GmailClient {
         let body = GmailBatch.buildRequestBody(ids: ids, format: format, boundary: boundary)
         var didRefreshAfter401 = false
         while true {
-            try await pace(units: GmailQuotaBucket.units(forMessageGets: ids.count))
+            try await pace(units: GmailQuotaBucket.units(
+                forMessageGets: ids.count, fullFormat: Self.isFullFormat(format)))
             var req = URLRequest(url: URL(string: "https://www.googleapis.com/batch/gmail/v1")!)
             req.httpMethod = "POST"
             req.setValue("Bearer \(try await validToken())", forHTTPHeaderField: "Authorization")

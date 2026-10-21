@@ -1,9 +1,10 @@
 import XCTest
 
-/// Gmail allows 250 quota units per user per second. A pass that fires four
-/// 50-message batches (250 units each) inside two seconds trips a 403
-/// rateLimitExceeded and the connection is dropped. The bucket paces
-/// requests so a pass stays under that ceiling.
+/// Gmail's per-user limit is 6,000 quota units a minute for Cloud projects
+/// created on or after 1 May 2026 (15,000 for older ones), and a full-format
+/// `messages.get` costs 60 units. A pass that fires batches back to back
+/// spends faster than that and trips a 403 rateLimitExceeded. The bucket
+/// paces requests so a pass stays under the ceiling.
 final class GmailQuotaBucketTests: XCTestCase {
     func testFullBucketSpendsWithoutDelay() {
         var bucket = GmailQuotaBucket(capacity: 250, refillPerSecond: 250)
@@ -43,30 +44,104 @@ final class GmailQuotaBucketTests: XCTestCase {
         XCTAssertEqual(bucket.delayBeforeSpending(units: 250, now: t0), 2.0, accuracy: 0.001)
     }
 
-    /// Gmail enforces 250 units/s as a moving average and a 50-message
-    /// batch spends 250 at once. Refilling below the ceiling, with smaller
-    /// batches, keeps a full pass under the average.
-    func testDefaultsStayUnderGmailsMovingAverage() {
+    /// The default tier must stay under 6,000 units a minute even for a
+    /// minute that starts with a full bucket: the burst plus everything the
+    /// refill adds over the following 60 seconds.
+    func testDefaultsStayUnderTheNewPerUserLimit() {
         let bucket = GmailQuotaBucket()
-        XCTAssertEqual(bucket.capacity, 125)
-        XCTAssertEqual(bucket.refillPerSecond, 200)
-        XCTAssertLessThanOrEqual(GmailQuotaBucket.units(forMessageGets: GmailClient.batchGetChunkSize), 125)
+        XCTAssertEqual(bucket.tier, .standard)
+        XCTAssertEqual(bucket.refillPerSecond, 90)
+        XCTAssertEqual(bucket.capacity, 540)
+        XCTAssertLessThanOrEqual(
+            bucket.capacity + 60 * bucket.refillPerSecond,
+            GmailQuotaTier.standard.unitsPerMinute)
+    }
+
+    /// The legacy tier is for grandfathered projects only, but it must be
+    /// consistent with the 15,000 it advertises.
+    func testLegacyTierStaysUnderFifteenThousand() {
+        let bucket = GmailQuotaBucket(tier: .legacy)
+        XCTAssertLessThanOrEqual(
+            bucket.capacity + 60 * bucket.refillPerSecond,
+            GmailQuotaTier.legacy.unitsPerMinute)
+        XCTAssertGreaterThan(bucket.refillPerSecond, GmailQuotaBucket.defaultRefillPerSecond)
+    }
+
+    /// A single batch must not spend more than the burst capacity, or every
+    /// batch would start by waiting for a refill that cannot arrive.
+    func testBatchFitsWithinTheBurstCapacity() {
+        let bucket = GmailQuotaBucket()
+        let batchCost = GmailQuotaBucket.units(forMessageGets: GmailClient.batchGetChunkSize)
+        XCTAssertLessThanOrEqual(batchCost, bucket.capacity)
     }
 
     func testMessageGetCosts() {
-        XCTAssertEqual(GmailQuotaBucket.units(forMessageGets: 1), 5)
-        XCTAssertEqual(GmailQuotaBucket.units(forMessageGets: 50), 250)
+        XCTAssertEqual(GmailQuotaBucket.units(forMessageGets: 1), 60)
+        XCTAssertEqual(GmailQuotaBucket.units(forMessageGets: 8), 480)
+        // metadata/minimal are the cheap formats.
+        XCTAssertEqual(GmailQuotaBucket.units(forMessageGets: 1, fullFormat: false), 20)
+        XCTAssertEqual(GmailQuotaBucket.units(forMessageGets: 50, fullFormat: false), 1_000)
     }
 
+    /// The per-method table from
+    /// https://developers.google.com/workspace/gmail/api/reference/quota
+    /// as of the 1 May 2026 change.
     func testEndpointCosts() {
         XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/profile"), 1)
         XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/history"), 2)
+        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/labels"), 1)
+        XCTAssertEqual(GmailClient.quotaCost(method: "POST", path: "/labels"), 5)
         XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/messages"), 5)
-        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/messages/m1"), 5)
-        XCTAssertEqual(GmailClient.quotaCost(method: "POST", path: "/threads/t1/modify"), 10)
         XCTAssertEqual(GmailClient.quotaCost(method: "POST", path: "/messages/send"), 100)
+        XCTAssertEqual(GmailClient.quotaCost(method: "POST", path: "/messages/m1/modify"), 5)
+        XCTAssertEqual(GmailClient.quotaCost(method: "POST", path: "/messages/m1/trash"), 20)
+        XCTAssertEqual(GmailClient.quotaCost(method: "POST", path: "/messages/m1/untrash"), 5)
+        XCTAssertEqual(GmailClient.quotaCost(method: "POST", path: "/threads/t1/modify"), 10)
+        XCTAssertEqual(GmailClient.quotaCost(method: "POST", path: "/threads/t1/trash"), 20)
+        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/drafts"), 5)
         XCTAssertEqual(GmailClient.quotaCost(method: "POST", path: "/drafts"), 10)
-        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/messages/m1/attachments/a1"), 5)
+        XCTAssertEqual(GmailClient.quotaCost(method: "DELETE", path: "/drafts/d1"), 10)
+    }
+
+    /// `messages.get` is 20 units for metadata and 60 for a full body — the
+    /// regression the issue reported (it was charged 5 for both).
+    func testMessageGetCostsDependOnFormat() {
+        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/messages/m1"), 20)
+        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/messages/m1",
+                                            format: "metadata"), 20)
+        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/messages/m1",
+                                            format: "minimal"), 20)
+        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/messages/m1",
+                                            format: "full"), 60)
+        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/messages/m1",
+                                            format: "raw"), 60)
+        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/messages/m1",
+                                            format: "html"), 60)
+    }
+
+    func testAttachmentAndThreadGetsUseTheNewPrices() {
+        XCTAssertEqual(GmailClient.quotaCost(method: "GET",
+                                             path: "/messages/m1/attachments/a1"), 20)
+        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/threads/t1"), 40)
+        XCTAssertEqual(GmailClient.quotaCost(method: "GET", path: "/threads/t1",
+                                             format: "full"), 120)
+    }
+
+    /// The tier is a setting; an unknown or absent value must fall back to
+    /// the safe (new-project) default rather than the generous one.
+    func testUnknownTierFallsBackToStandard() {
+        let key = GmailQuotaTier.defaultsKey
+        let saved = UserDefaults.standard.string(forKey: key)
+        defer {
+            if let saved { UserDefaults.standard.set(saved, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+        UserDefaults.standard.removeObject(forKey: key)
+        XCTAssertEqual(GmailQuotaTier.current, .standard)
+        UserDefaults.standard.set("nonsense", forKey: key)
+        XCTAssertEqual(GmailQuotaTier.current, .standard)
+        UserDefaults.standard.set(GmailQuotaTier.legacy.rawValue, forKey: key)
+        XCTAssertEqual(GmailQuotaTier.current, .legacy)
     }
 
     func testPenaltyBlocksAllCallersUntilItExpires() {
